@@ -1,0 +1,628 @@
+---
+title: "PredictR"
+output: html_notebook
+Developers: Jacob Messineo, Danny Malloy, David Kramer
+---
+
+
+
+Load the Necessary Packages
+Tidyverse: Used for data wrangling and clenaing
+Stringr: Used for data cleaning##
+Forecast: Used for forecasting and accuracy calculations on our various tested models
+Leaps: Used for linear regression model-building
+
+```{r}
+library(tidyverse)
+library(stringr)
+library(forecast)
+library(dummies)
+library(leaps)
+```
+
+Load the artists and tracks datasets
+Artists: Contains popularity metrics of various artists on the Spotify platform
+Tracks: Contains various tracks and corresponding musicological variables
+
+```{r}
+artists <- read.csv("artists.csv")
+tracks.all <- read.csv("tracks.csv")
+
+```
+
+Check for missing values and remove as needed
+
+```{r}
+which(is.na(tracks.all)) ##No missing values##
+artists <- artists[-which(is.na(artists)),]
+```
+
+Process 1: Do Not Account for Artist Popularity
+
+Given the sheer size of the tracks dataset, we will filter all songs released in the 21st century in order to concentrate our analysis
+So as to mitigate issues with calculated forecast accuracy on various models, we will also filter out all songs with a popularity score of 0
+
+```{r}
+tracks <- tracks.all %>%
+  filter(str_detect(release_date, "^2"))%>%
+  filter(popularity != 0)
+
+##Filter out the track ID, track name, contributing artist(s), name(s) of contributing artist(s), and release date in the data frame##
+##When not accounting for individual artist popularity, these variables are not relevant predictors of song popularity on Spotify##
+tracks <- tracks[-c(1,2,6,7,8)]
+
+##Convert the explicit and time_signature columns to factors##
+tracks <- tracks%>%
+  mutate(explicit = as.factor(explicit), time_signature = as.factor(time_signature))
+
+##Create dummy variables for all categorical variables in the data frame##
+tracks <- dummy.data.frame(tracks, sep = ".")
+
+```
+
+PCA Analysis
+
+```{r}
+
+pcs.cor <- prcomp(tracks, scale. = T)
+summary(pcs.cor)
+
+
+#For nomalized data, we need 13 princial components
+
+pcs.cor$rotation[,1:13]
+
+
+##Since none of the variables stand out majorly in the PCA analysis as taking up a large part of the variance, we will proceed to running regressions and using elimination methods to select variables instead.
+
+```
+
+
+
+
+Partition the data as follows:
+60% of the sample will compose the training set
+30% of the sample will compose the validation set
+10% of the sample will compose the test set
+
+```{r}
+RNGkind(sample.kind = "Rounding")
+set.seed(1)
+train.rows <- sample(rownames(tracks), dim(tracks)[1]*0.6)
+valid.rows <- sample(setdiff(rownames(tracks), train.rows), dim(tracks)[1]*0.3)
+test.rows <- setdiff(rownames(tracks), union(train.rows, valid.rows))
+train.data <- tracks[train.rows,]
+valid.data <- tracks[valid.rows,]
+test.data <- tracks[test.rows,]
+```
+
+Build a basic linear model containing all of the relevant predictors in the tracks dataset
+
+```{r}
+gc()
+track.lm <- lm(popularity ~., data = train.data)
+
+##Use this basic model to predict the popularity of tracks in the validation set##
+track.lm.pred <- predict(track.lm, valid.data)
+wholistic_accuracy <- accuracy(track.lm.pred, valid.data$popularity)
+data.frame(track.lm.pred, valid.data$popularity)
+```
+
+Now, let's perform an exhaustive search on the tracks dataset
+
+```{r}
+exhaustive_search <- regsubsets(popularity~ ., data = train.data, nbest = 1, nvmax = dim(train.data)[2], method = "exhaustive")
+exhaustive_summary <- summary(exhaustive_search)
+exhaustive_summary
+exhaustive_summary$which
+exhaustive_summary$adjr2
+Adjr2 <- which.max(exhaustive_summary$adjr2)
+Adjr2
+```
+
+This analysis indicates that 14 predictors provide statistically significant contribution to the accuracy of the model
+Now, form a linear model with the significant predictors found via exhaustive search, and use the model to forecast the popularity of songs in the validation set
+
+```{r}
+track.lm.exhaust <- lm(popularity ~ energy + loudness + duration_ms + explicit.0 + explicit.1 + danceability + key + speechiness +liveness + valence + tempo + time_signature.0 + time_signature.3 + instrumentalness, data = train.data)
+track.lm.exhaust.pred <- predict(track.lm.exhaust, valid.data)
+exhaust_accuracy <- accuracy(track.lm.exhaust.pred, valid.data$popularity)
+```
+
+Perform forward selection on the tracks dataset
+
+```{r}
+track.lm.null <- lm(popularity~1, data = train.data)
+track.lm.step <- step(track.lm.null, scope=list(lower=track.lm.null, upper=track.lm), direction = "forward")
+summary(track.lm.step)  
+track.lm.step.pred <- predict(track.lm.step, valid.data)
+forward_accuracy <- accuracy(track.lm.step.pred, valid.data$popularity)
+```
+
+Perform backward elimination on the tracks dataset
+
+```{r}
+tracks_backward <- step(track.lm, direction = "backward")
+summary(tracks_backward)
+tracks_backward_pred <- predict(tracks_backward, valid.data)
+backward_accuracy <- accuracy(tracks_backward_pred, valid.data$popularity)
+```
+
+Perform stepwise regression on the tracks dataset
+
+```{r}
+tracks_stepwise <- step(track.lm, direction = "both")
+summary(tracks_stepwise)
+tracks_stepwise_pred <- predict(tracks_stepwise, valid.data)
+stepwise_accuracy <- accuracy(tracks_stepwise_pred, valid.data$popularity)
+```
+
+Compare the relative accuracies of each model, and determine the most accurate model out of our employed methods
+
+```{r}
+exhaust_accuracy
+backward_accuracy
+forward_accuracy
+stepwise_accuracy
+wholistic_accuracy
+```
+
+In light these results, we conclude that the FORWARD SELECTION model provides the simplest, most effective model for Spotity song popularity forecasting
+
+NOTE: None of the models formed above account for the relative popularity of individual artists. Hence, the models may possess a substantial amount of error that could be mitigated by accounting for individual artist popularity
+
+Process 2: Account for Artist Popularity
+
+Given the sheer size of the tracks dataset, we will filter all songs released in the 21st century in order to concentrate our analysis
+So as to mitigate issues with calculated forecast accuracy on various models, we will also filter out all songs with a popularity score of 0
+
+We also will merge artist data to the tracks data and perform a series of data-cleaning practices to prep the data for regression.
+
+```{r}
+tracks.artist <- tracks.all %>%
+  filter(str_detect(release_date, "^2"))%>%
+  filter(popularity != 0)
+
+##Mutate the string values in the id_artists column so as to prepare for dataframe merging by artist ID##
+tracks.artist <- tracks.artist%>%
+  mutate(id_artists = gsub("\\[|\\]", "", tracks.artist$id_artists))
+
+tracks.artist <- tracks.artist%>%
+  mutate(id_artists = gsub("\\'|\\'", "", tracks.artist$id_artists))
+
+
+##Separate the id_artists column into the primary artist (the artist listed first) and all other featured artist per track##
+##This simplifies our analysis and consequent model-building##
+tracks.artist <- tracks.artist%>%
+  separate(id_artists, c("id_artists", "other"), sep = ",")
+  
+##Now, merge the artists and tracks dataframes by the artist ID##
+##This will allow us to (potentially) include relative artist popularity into our linear regression models##
+tracks.artist <- merge(tracks.artist, artists, by.x = "id_artists", by.y = "id", all.x = TRUE, all.y = FALSE)
+
+##Find the rows of the merged dataframe with NA values, if any##
+nas <- which(is.na(tracks.artist$popularity.y))
+
+##Given the scarcity of these NA value rows, it is fitting to remove them from the large sample of filtered Spotify tracks entirely##
+tracks.artist <- tracks.artist[-nas,]
+
+##Remove all rows that contain track information to produce a dataframe consisting of only possible predictors (categorical and numeric) and the predicted variable (track popularity)##
+tracks.artist <- tracks.artist[-c(1,2,3,7,8,9,22,23,24)]
+
+##Rename the track's popularity and artist's popularity in the merged dataframe##
+tracks.artist <- tracks.artist%>%
+  rename(popularity = popularity.x, artist_popularity = popularity.y)
+
+##As above, convert the explicit and time_signature into factors##
+tracks.artist <- tracks.artist%>%
+  mutate(explicit = as.factor(explicit), time_signature = as.factor(time_signature))
+
+##Create dummy variables for all factors in the dataframe##
+tracks.artist <- dummy.data.frame(tracks.artist, sep = ".")
+```
+
+PCA Analysis
+
+```{r}
+
+pcs.cor2 <- prcomp(tracks.artist, scale. = T)
+summary(pcs.cor)
+
+
+#For nomalized data, we need 13 princial components
+
+pcs.cor2$rotation[,1:13]
+
+
+##Since none of the variables stand out majorly in the PCA analysis as taking up a large part of the variance, we will proceed to running regressions and using elimination methods to select variables instead.
+
+
+```
+
+
+Partition the data as follows:
+60% of the sample will compose the training set
+30% of the sample will compose the validation set
+10% of the sample will compose the test set
+
+```{r}
+RNGkind(sample.kind = "Rounding")
+set.seed(1)
+train.rows2 <- sample(rownames(tracks.artist), dim(tracks.artist)[1]*0.6)
+
+valid.rows2 <- sample(setdiff(rownames(tracks.artist), train.rows2), dim(tracks.artist)[1]*0.3)
+
+test.rows2 <- setdiff(rownames(tracks.artist), union(train.rows2, valid.rows2))
+
+train.data2 <- tracks.artist[train.rows2,]
+valid.data2 <- tracks.artist[valid.rows2,]
+test.data2 <- tracks.artist[test.rows2,]
+```
+
+Build a basic linear model containing all of the relevant predictors in the tracks dataset
+Use this basic model to predict the popularity of tracks in the validation set
+
+```{r}
+gc()
+track.lm2 <- lm(popularity ~ ., data = train.data2)
+
+track.lm.pred2 <- predict(track.lm2, valid.data2)
+wholistic_accuracy2 <- accuracy(track.lm.pred2, valid.data2$popularity)
+data.frame(track.lm.pred2, valid.data2$popularity)
+```
+
+Now, let's perform an exhaustive search on the merged tracks dataset
+
+```{r}
+exhaustive_search2 <- regsubsets(popularity~ ., data = train.data2, nbest = 1, nvmax = dim(train.data2)[2], method = "exhaustive")
+exhaustive_summary2 <- summary(exhaustive_search2)
+exhaustive_summary2
+exhaustive_summary2$which
+exhaustive_summary2$adjr2
+New.Adjr2 <- which.max(exhaustive_summary2$adjr2)
+New.Adjr2
+
+```
+
+This analysis indicates that 15 predictors provide statistically significant contribution to the accuracy of the model
+Now, form a linear model with the significant predictors found via exhaustive search, and use the model to forecast the popularity of songs in the validation set
+
+```{r}
+track.lm.exhaust2 <- lm(popularity ~ energy + loudness + duration_ms + explicit.0 + explicit.1 + danceability + key + speechiness +liveness + valence + tempo + time_signature.0 + time_signature.3 + instrumentalness + artist_popularity, data = train.data2)
+track.lm.exhaust.pred2 <- predict(track.lm.exhaust2, valid.data2)
+exhaust_accuracy2 <- accuracy(track.lm.exhaust.pred2, valid.data2$popularity)
+```
+
+Perform forward selection on the merged tracks dataset
+
+```{r}
+track.lm.null2 <- lm(popularity~1, data = train.data2)
+track.lm.step2 <- step(track.lm.null2, scope=list(lower=track.lm.null2, upper=track.lm2), direction = "forward")
+summary(track.lm.step2)  
+track.lm.step.pred2 <- predict(track.lm.step2, valid.data2)
+forward_accuracy2 <- accuracy(track.lm.step.pred2, valid.data2$popularity)
+```
+
+Perform backward elimination on the merged tracks database
+
+```{r}
+tracks_backward2 <- step(track.lm2, direction = "backward")
+summary(tracks_backward2)
+tracks_backward_pred2 <- predict(tracks_backward2, valid.data2)
+backward_accuracy2 <- accuracy(tracks_backward_pred2, valid.data2$popularity)
+```
+
+Perform stepwise regression on the merged tracks database
+
+```{r}
+tracks_stepwise2 <- step(track.lm2, direction = "both")
+summary(tracks_stepwise2)
+tracks_stepwise_pred2 <- predict(tracks_stepwise2, valid.data2)
+stepwise_accuracy2 <- accuracy(tracks_stepwise_pred2, valid.data2$popularity)
+```
+
+Compare the relative accuracies of each model, and determine the most accurate model out of our employed methods
+
+```{r}
+exhaust_accuracy2
+backward_accuracy2
+forward_accuracy2
+stepwise_accuracy2
+wholistic_accuracy2
+```
+
+In light these results, when accounting for artist popularity, we conclude that the FORWARD SELECTION model provides the simplest, most effective and most accurate model for Spotity song popularity forecasting
+
+Compare the Process 1 model (no accounting for artist popularity) with the Process 2 model (accounting for artist popularity) with respect to forecasting accuracy
+
+```{r}
+forward_accuracy
+forward_accuracy2
+```
+
+As shown, artist popularity significantly contributes to the accuracy of the model
+Thus, the forward selection model of Process 2 should be used
+
+Apply the test data on the prescribed forward selection model
+
+```{r}
+tracks.lm.step.test <- predict(track.lm.step, test.data)
+tracks.lm.step.test2 <- predict(track.lm.step2, test.data2)
+```
+
+Calculate accuracy of the Process 1 and Process 2 models on the actual test data
+
+```{r}
+test_accuracy <- accuracy(tracks.lm.step.test, test.data$popularity)
+test_accuracy2 <- accuracy(tracks.lm.step.test2, test.data2$popularity)
+test_accuracy
+test_accuracy2
+```
+
+As shown, Process 2 holds greater predictive accuracy on the test data
+This insight aligns with our conclusion
+
+
+Visualizations and Exploratory Analysis
+
+Plotting Process 1 Residuals
+
+This plot creates a histogram showing the distribution of residuals when not accounting for artist popularity
+
+```{r}
+###Establish the figure of the plot##
+par(mfrow = c(1,1))
+
+##Calculate the residuals of the forward selection Process 1 model##
+forward.resids <- valid.data$popularity - track.lm.step.pred 
+
+##Build the histogram##
+hist(forward.resids, breaks = 25, xlab = "Residuals for Forward Selection without Artist Popularity ", main = "", col = 'green')
+```
+
+Plotting Process 2 Residuals
+This plot creates a histogram showing the distribution of residuals when not accounting for artist popularity
+
+```{r}
+##Calculate the residuals of the forward selection Process 2 model##
+forward.resids2 <- valid.data2$popularity - track.lm.pred2
+
+##Build the histogram##
+hist(forward.resids2, breaks = 25, xlab = "Residuals for Forward Selection with Artist Popularity", main = "", col = "dark green")
+```
+
+Histogram of Song Popularity
+This pair of histograms shows a distribution of track popularity across the Spotify platform
+
+```{r}
+##The first histogram plots the entire sample of Spotify songs##
+hist(tracks.all$popularity, breaks = 10, xlab = "Popularity Distribution", main = "All Songs", col = "dark green")
+
+##The second histogram plots the filtered sample containing songs released in the 21st century##
+hist(tracks$popularity, breaks = 10, xlab = "Popularity Distribution", main = "21st Century Songs", col = 'dark green')
+```
+
+Given the distribution of the data and the research we have done on Spotify's consumer base, it is clear that using data from all decades would skew our model significantly.
+Thus, we have limited our data to account for this to just 21st century data.
+Utilizing the filtered sample of data (seen in Histogram 2) provides a more normal distribution of popularity across tracks
+
+Provide the summary statistics of song popularity, both in the general sample and the filtered sample
+
+```{r}
+summary(tracks.all$popularity)
+summary(tracks$popularity)
+
+```
+
+Plotting Artist Popularity vs. Track Popularity
+Provide a scatterplot of popularity by artist popularity, including a smoothed line to indicate the upward trend
+Results: A rigid threshold of song popularity as dictated by artist popularity
+This result matches our intuition
+
+```{r}
+tracks.artist %>%
+  ggplot() +
+  geom_point(mapping = aes(x = artist_popularity, y = popularity), col = "green", alpha = .8)+
+  geom_smooth(mapping = aes(x = artist_popularity, y = popularity), col = 'dark green', size = 1.5)+
+  labs(title = "Song Popularity by Artist Popularity")+
+  xlab("Artist Popularity") + ylab("Song Popularity")+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+
+Popularity Distribution by Genre
+
+```{r}
+##Create a subset of tracks containing all songs released during or after 2000##
+tracks.artist.vis <- tracks.all %>%
+  filter(str_detect(release_date, "^2"))%>%
+  filter(popularity != 0)
+
+##Clean the data such that the artist ID matches the song ID##
+tracks.artist.vis <- tracks.artist.vis%>%
+  mutate(id_artists = gsub("\\[|\\]", "", tracks.artist.vis$id_artists))
+
+tracks.artist.vis <- tracks.artist.vis%>%
+  mutate(id_artists = gsub("\\'|\\'", "", tracks.artist.vis$id_artists))
+
+##Separate the id_artist column into the primary artist ID and all other artist IDs##
+tracks.artist.vis <- tracks.artist.vis%>%
+  separate(id_artists, c("id_artists", "other"), sep = ",")
+
+##Merge the filtered tracks and artist datasets##
+tracks.artist.vis <- merge(tracks.artist.vis, artists, by.x = "id_artists", by.y = "id", all.x = TRUE, all.y = FALSE)
+
+##Find and remove all rows containing missing values##
+nas <- which(is.na(tracks.artist.vis$popularity.y))
+tracks.artist.vis <- tracks.artist.vis[-nas,]
+
+##Rename the popularity columns to accurately reflect track popularity and artist popularity##
+tracks.artist.vis <- tracks.artist.vis%>%
+  rename(popularity = popularity.x, artist_popularity = popularity.y)
+
+##Separate the genre column by primary genre (first listed) and all other genres##
+tracks.artist.vis <- tracks.artist.vis%>%
+  separate(genres, c("genre_primary", "other"), sep = ",")
+
+##Clean the primary genre column so as to establish consistency##
+tracks.artist.vis <- tracks.artist.vis%>%
+  mutate(genre_primary = gsub("\\[|\\]", "", tracks.artist.vis$genre_primary))
+
+tracks.artist.vis <- tracks.artist.vis%>%
+  mutate(genre_primary = gsub("\\'|\\'", "", tracks.artist.vis$genre_primary))
+```
+
+```{r}
+##Filter the dataset such that only noteworthy genres (rap, pop, country, edm, hip hop, rock , r&b) are included##
+data.for.analysis3 <- tracks.artist.vis %>%
+  filter(genre_primary == 'rap' | genre_primary == 'pop' | genre_primary == "country" | genre_primary == 'edm' | genre_primary == 'hip hop' | genre_primary == 'rock' | genre_primary == 'r&b')
+
+par(mfrow = c(1,2))
+
+##Plot the relationship between artist popularity and track popularity, coloring by this subset of noteworthy genres##
+ggplot(data = data.for.analysis3)+
+  geom_point(mapping = aes(x = artist_popularity, y=popularity, color = genre_primary), size = 2)+
+  labs(title = "Song Popualrity vs Artist Popularity By Genre")
+
+```
+
+```{r}
+
+##Plot the popularity of tracks by energy level, coloring by the primary genre of the track##
+ggplot(data = data.for.analysis3)+
+  geom_point(mapping = aes(x = energy, y=popularity, color = genre_primary), size = 2)+
+  labs(title = "Song Popualrity vs Energy By Genre")
+```
+
+Plot the population of tracks by the track's duration in milliseconds
+
+```{r}
+ggplot(data = tracks.all, mapping = aes(x = duration_ms, y = popularity)) + 
+  geom_point(col = "dark green")
+```
+
+Plotting Predicted vs Actual of Process 1 and Process 2 Models
+Build a data frame of Process 1 predicted values and actual validation values 
+
+```{r}
+model1.comp <- data.frame(track.lm.step.pred, valid.data$popularity)
+
+##Rename the dataframe columns accordingly##
+model1.comp <- model1.comp%>%
+  rename(Predicted_Value = track.lm.step.pred, Actual_Value = valid.data.popularity)
+
+##Build a dataframe of Process 2 predicted values and actual validation values
+model2.comp <- data.frame(track.lm.step.pred2, valid.data2$popularity)
+
+##Rename the dataframe columns accordingly##
+model2.comp <- model2.comp%>%
+  rename(Predicted_Value = track.lm.step.pred2, Actual_Value = valid.data2.popularity)
+
+##Establish mulitple plots##
+par(mfrow = c(1,2))
+
+##Visualize the relationship between actual validation values and Process 1 predicted values, including an actual = actual accuracy reference line and a smoothed trendline##
+ggplot(data = model1.comp)+
+  geom_point(mapping = aes(x = Actual_Value, y= Predicted_Value), col = "grey", alpha = .4)+
+  geom_line(mapping = aes(x=Actual_Value, y=Actual_Value), col = "black", size = 1) +
+  geom_smooth(mapping = aes(x = Actual_Value, y = Predicted_Value), size = 1, col = 'green')+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+  labs(title = "Predicted vs. Actual Popularity Model 1 (Validation)")
+
+```
+
+```{r}
+
+##Visualize the relationship between actual validation values and Process 2 predicted values, including an actual = actual accuracy reference line and a smoothed trendline##
+ggplot(data = model2.comp)+
+  geom_point(mapping = aes(x= Actual_Value, y = Predicted_Value), col = 'grey', alpha = .4) + 
+  geom_line(mapping = aes(x=Actual_Value, y=Actual_Value), col = "black", size = 1) +
+  geom_smooth(mapping = aes(x = Actual_Value, y = Predicted_Value), size = 1, col = 'dark green')+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+  labs(title = "Predicted vs. Actual Popularity Model 2 (Validation)")
+
+```
+
+
+As seen, Process 2 follows the accuracy reference line more closely
+
+Plotting Predicted vs. Actual Test Values
+
+```{r}
+##Build a data frame of Process 1 predicted values and actual test values 
+model3.comp <- data.frame(tracks.lm.step.test, test.data$popularity)
+
+##Rename the columns of the dataframe accordingly##
+model3.comp <- model3.comp%>%
+  rename(Predicted_Value = tracks.lm.step.test, Actual_Value = test.data.popularity)
+
+##Build a data frame of Process 2 predicted values and actual test values 
+model4.comp <- data.frame(tracks.lm.step.test2, test.data2$popularity)
+
+##Rename the columns of the dataframe accordingly##
+model4.comp <- model4.comp%>%
+  rename(Predicted_Value = tracks.lm.step.test2, Actual_Value = test.data2.popularity)
+
+##Establish multiple plots##
+par(mfrow = c(1,2))
+
+##Visualize the relationship between actual test values and Process 1 predicted values, including an actual = actual accuracy reference line and a smoothed trendline##
+ggplot(data = model3.comp)+
+  geom_point(mapping = aes(x = Actual_Value, y= Predicted_Value), col = "grey", alpha = .4)+
+  geom_line(mapping = aes(x=Actual_Value, y=Actual_Value), col = "black", size = 1) +
+  geom_smooth(mapping = aes(x = Actual_Value, y = Predicted_Value), size = 1, col = 'green')+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+  labs(title = "Predicted vs. Actual Popularity Model 1 (Test)")
+```
+
+
+```{r}
+
+##Visualize the relationship between actual test values and Process 2 predicted values, including an actual = actual accuracy reference line and a smoothed trendline##
+ggplot(data = model4.comp)+
+  geom_point(mapping = aes(x= Actual_Value, y = Predicted_Value), col = 'grey', alpha = .4) + 
+  geom_line(mapping = aes(x=Actual_Value, y=Actual_Value), col = "black", size = 1) +
+  geom_smooth(mapping = aes(x = Actual_Value, y = Predicted_Value), size = 1, col = 'dark green')+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+  labs(title = "Predicted vs. Actual Popularity Model 2 (Test)")
+
+```
+
+As seen, the Process 2 predicted values follow the accuracy reference line more closely.
+
+This insight aligns with our conclusion.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
